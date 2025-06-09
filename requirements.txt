@@ -4,3 +4,4 @@ torchvision
 transformers==4.38.2
 pillow
 plotly
+numpy
