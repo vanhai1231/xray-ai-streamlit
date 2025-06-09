@@ -1,12 +1,13 @@
 import streamlit as st
 from PIL import Image
 import torch
+import torch.nn as nn
 from torchvision import transforms
-from transformers import AutoModelForImageClassification, AutoFeatureExtractor
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
-import base64
+import numpy as np
+import requests
 from io import BytesIO
 
 # Cấu hình trang
@@ -118,25 +119,85 @@ with st.sidebar:
     để có chẩn đoán chính xác.
     """)
 
+# Định nghĩa Simple CNN model
+class SimpleCNN(nn.Module):
+    def __init__(self, num_classes=2):
+        super(SimpleCNN, self).__init__()
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+        )
+        self.classifier = nn.Sequential(
+            nn.AdaptiveAvgPool2d((7, 7)),
+            nn.Flatten(),
+            nn.Linear(128 * 7 * 7, 256),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(256, num_classes)
+        )
+        
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.classifier(x)
+        return x
+
 # Load model (với cache để tối ưu hiệu suất)
 @st.cache_resource
 def load_model():
     try:
-        model = AutoModelForImageClassification.from_pretrained("vanhai123/simple-cnn-chest-xray")
-        extractor = AutoFeatureExtractor.from_pretrained("vanhai123/simple-cnn-chest-xray")
-        model.eval()
-        return model, extractor
+        # Thử tải từ Hugging Face Hub
+        try:
+            from huggingface_hub import hf_hub_download
+            model_path = hf_hub_download(repo_id="vanhai123/simple-cnn-chest-xray", filename="model.pth")
+            model = SimpleCNN(num_classes=2)
+            model.load_state_dict(torch.load(model_path, map_location='cpu'))
+            model.eval()
+            
+            # Định nghĩa transform
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            
+            return model, transform, True
+            
+        except Exception as hub_error:
+            st.warning(f"Không thể tải model từ Hugging Face: {hub_error}")
+            # Fallback: Tạo model demo
+            model = SimpleCNN(num_classes=2)
+            transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ])
+            return model, transform, False
+            
     except Exception as e:
         st.error(f"Lỗi khi tải model: {str(e)}")
-        return None, None
+        return None, None, False
 
 # Tải model
 with st.spinner("🔄 Đang tải AI model..."):
-    model, extractor = load_model()
+    model, transform, is_trained = load_model()
 
-if model is None or extractor is None:
+if model is None:
     st.error("❌ Không thể tải model. Vui lòng thử lại sau.")
     st.stop()
+
+# Thông báo trạng thái model
+if not is_trained:
+    st.warning("⚠️ Đang sử dụng model demo. Kết quả chỉ mang tính minh họa.")
+
+# Định nghĩa labels
+id2label = {0: "Normal", 1: "Pneumonia"}
 
 # Layout chính
 col1, col2 = st.columns([1, 1])
@@ -180,22 +241,30 @@ if uploaded_file:
         # Phân tích ảnh
         with st.spinner("🤖 AI đang phân tích ảnh..."):
             # Tiền xử lý ảnh
-            inputs = extractor(images=image, return_tensors="pt")
+            input_tensor = transform(image).unsqueeze(0)
             
             # Dự đoán
             with torch.no_grad():
-                outputs = model(**inputs)
-                probs = torch.softmax(outputs.logits, dim=1)
-                pred_idx = torch.argmax(probs, dim=1).item()
-                confidence = probs[0][pred_idx].item()
+                if is_trained:
+                    outputs = model(input_tensor)
+                    probs = torch.softmax(outputs, dim=1)
+                    pred_idx = torch.argmax(probs, dim=1).item()
+                    confidence = probs[0][pred_idx].item()
+                    all_probs = probs[0].numpy()
+                else:
+                    # Demo mode - random results for demonstration
+                    import random
+                    random.seed(42)  # For consistent demo results
+                    all_probs = np.array([random.uniform(0.3, 0.9), random.uniform(0.1, 0.7)])
+                    all_probs = all_probs / all_probs.sum()  # Normalize
+                    pred_idx = np.argmax(all_probs)
+                    confidence = all_probs[pred_idx]
                 
-                # Lấy tất cả xác suất
-                all_probs = probs[0].numpy()
-                labels = [model.config.id2label[i] for i in range(len(all_probs))]
+                labels = list(id2label.values())
         
         # Hiển thị kết quả
         with col2:
-            label = model.config.id2label[pred_idx]
+            label = id2label[pred_idx]
             
             # Kết quả chính
             if label.lower() == "normal":
